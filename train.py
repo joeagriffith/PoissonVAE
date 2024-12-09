@@ -9,10 +9,12 @@ def train(
         model,
         train_dataset,
         val_dataset,
-        n_epochs: int = 100,
+        n_epochs: int = 250,
         batch_size: int = 256,
-        lr: float = 2e-3,
         wd: float = 3e-4,
+        lr_start: float = 3e-5,
+        lr_end: float = 1e-6,
+        lr_portion: float = 0.9,
         beta_start: float = 0.0,
         beta_end: float = 1.0,
         beta_portion: float = 0.6,
@@ -21,15 +23,18 @@ def train(
         temp_portion: float = 0.5,
         grad_clip: float = None,
 ):
+    model_forward = torch.compile(model.forward)
 
     device = next(model.parameters()).device
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr_start, weight_decay=wd)
 
     lr_scheduler = None
     # lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=n_epochs/5)
+    lrs = torch.ones(n_epochs) * lr_end
+    lrs[:int(n_epochs * lr_portion)] = cosine_schedule(lr_start, lr_end, int(n_epochs * lr_portion))
 
     # Set beta and temp schedules if required
     betas, temps = None, None
@@ -54,6 +59,10 @@ def train(
     # Training epoch loop
     for epoch in range(n_epochs):
         model.train()
+
+        # Update optimizer parameters
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = lrs[epoch]
 
         # Update beta and temp if required
         if betas is not None:
@@ -82,16 +91,18 @@ def train(
 
             # Inference
             x = x.to(device)
-            out = model(x)
-            loss, recon_loss, kl_loss = model.loss(x, out)
+            with torch.amp.autocast(device.type, dtype=torch.bfloat16):
+                # out = model(x)
+                out = model_forward(x)
+                loss, recon_loss, kl_loss = model.loss(x, out)
 
-            # Backprop
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            if grad_clip:
-                max_norm = grad_clip * 3
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
-            optimizer.step()
+                # Backprop
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                if grad_clip:
+                    max_norm = grad_clip * 3
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
+                optimizer.step()
 
             # Accumulate training batch for logging
             loss_total += loss.item()
@@ -120,8 +131,10 @@ def train(
             # Inference
             with torch.no_grad():
                 x = x.to(device)
-                out = model(x)
-                loss, recon_loss, kl_loss = model.loss(x, out)
+                # out = model(x)
+                with torch.amp.autocast(device.type, dtype=torch.bfloat16):
+                    out = model_forward(x)
+                    loss, recon_loss, kl_loss = model.loss(x, out)
 
             # Accumulate validation batch for logging
             val_loss_total += loss.item()

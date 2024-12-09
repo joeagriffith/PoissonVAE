@@ -5,8 +5,8 @@ from tqdm import tqdm
 import numpy as np
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.metrics import classification_report
-import itertools
 import pandas as pd
+from functional import embed_dataset, get_balanced_subset
 
 
 def evaluate(
@@ -14,48 +14,23 @@ def evaluate(
         dataset,
 ):
     model.eval()
-    embeddings, labels, mse = get_embeddings_and_mse(model, dataset)
+    embeddings, labels = embed_dataset(model, dataset)
     logs = linear_probing(model, embeddings, labels, n_train=200)
-    logs['mse'] = mse
+    logs['recon_loss'] = mse_dataset(model, dataset)
     return logs
 
-def get_embeddings_and_mse(model, dataset):
+def mse_dataset(model, dataset):
     device = next(model.parameters()).device
-    dataloader = torch.utils.data.DataLoader(dataset, batch_size=256, shuffle=False)
+    batch_size = 256
+    dataloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=False)
 
-    embeddings = torch.empty((len(dataset), model.z_dim), device=device)
-    labels = torch.empty(len(dataset), dtype=torch.long, device=device)
-
-    # Calculate Embeddings and MSE
     mse = 0.0
-    for i, (x, y) in enumerate(dataloader):
+    for x, _ in dataloader:
         x = x.to(device)
         out = model(x)
-        embeddings[i*len(x):(i+1)*len(x)] = out[1].detach()
-        labels[i*len(x):(i+1)*len(x)] = y
+        mse += model.loss(x, out)[1].item()
+    return mse / len(dataset)
 
-        mse += F.mse_loss(out[0], x, reduction='sum').item()
-    
-    mse /= len(dataset)
-    
-    return embeddings, labels, mse
-
-def split(embeddings: torch.Tensor, labels: torch.Tensor, n_train: int):
-    n_per_class = n_train // 10
-    train_embeddings, train_labels, test_embeddings, test_labels = [], [], [], []
-    for i in range(10):
-        indices = torch.where(labels == i)[0]
-        train_embeddings.append(embeddings[indices[:n_per_class]])
-        train_labels.append(labels[indices[:n_per_class]])
-        test_embeddings.append(embeddings[indices[n_per_class:]])
-        test_labels.append(labels[indices[n_per_class:]])
-
-    train_embeddings = torch.cat(train_embeddings)
-    train_labels = torch.cat(train_labels)
-    test_embeddings = torch.cat(test_embeddings)
-    test_labels = torch.cat(test_labels)
-
-    return train_embeddings, train_labels, test_embeddings, test_labels
 
 def knn_analysis(
         model,
@@ -63,8 +38,7 @@ def knn_analysis(
 		n_iter: int = 5,
         n_train: int = 200,
 ):
-    embeddings, labels, _ = get_embeddings_and_mse(model, dataset)
-
+    embeddings, labels = embed_dataset(model, dataset)
     
     knn_defaults = dict(
         n_neighbors=5,
@@ -77,7 +51,7 @@ def knn_analysis(
 
     accs = []
     for i in range(n_iter):
-        train_x, train_y, test_x, test_y = split(embeddings, labels, n_train)
+        train_x, train_y, test_x, test_y = get_balanced_subset(embeddings, labels, n_train)
         train_x = train_x.cpu().numpy()
         train_y = train_y.cpu().numpy()
         test_x = test_x.cpu().numpy()
@@ -111,7 +85,7 @@ def linear_probing(
     lr = 0.1
     wd = 0.005
 
-    train_x, train_y, test_x, test_y = split(embeddings, labels, n_train)
+    train_x, train_y, test_x, test_y = get_balanced_subset(embeddings, labels, n_train)
 
     param_dict = {pn: p for pn, p in classifier.named_parameters()}
     param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
